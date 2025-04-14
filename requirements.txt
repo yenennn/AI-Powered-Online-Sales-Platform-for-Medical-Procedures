@@ -1,0 +1,8 @@
+google-genai
+python-dotenv
+numpy
+pandas
+python-docx
+langchain
+tiktoken
+transitions
