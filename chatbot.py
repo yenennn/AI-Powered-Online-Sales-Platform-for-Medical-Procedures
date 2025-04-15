@@ -51,6 +51,13 @@ class Application:
         self.machine.add_transition(trigger='human_intervention_triggered', source=['greeting', 'operation_selection', 'doctor_selection', 'negotiation'], dest='intervention')
         self.machine.add_transition(trigger='human_intervention_concluded', source='intervention', dest='bye_bye')
 
+        self.machine.add_transition(trigger='human_intervention_triggered', source='greeting', dest='intervention')
+        self.machine.add_transition(trigger='human_intervention_triggered', source='operation_selection',
+                                    dest='intervention')
+        self.machine.add_transition(trigger='human_intervention_triggered', source='doctor_selection',
+                                    dest='intervention')
+        self.machine.add_transition(trigger='human_intervention_triggered', source='negotiation', dest='intervention')
+        self.machine.add_transition(trigger='human_intervention_concluded', source='intervention', dest='bye_bye')
 class Doctor:
     def __init__(self, name, surname, specialty, operations_list):
         self.name = name
