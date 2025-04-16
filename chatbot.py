@@ -13,7 +13,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from transitions import Machine
 
 load_dotenv()
-
+#deneme
 def llm_analyze_sentiment(text):
     gemini_key = os.getenv('GEMINI_KEY')
     client = genai.Client(api_key=gemini_key)
