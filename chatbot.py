@@ -16,8 +16,6 @@ load_dotenv()
 
 def llm_analyze_sentiment(text):
     gemini_key = os.getenv('GEMINI_KEY')
-    if not gemini_key:
-        raise ValueError("Please set GEMINI_KEY in your .env file")
     client = genai.Client(api_key=gemini_key)
     prompt = f"Analyze the sentiment of the following text and respond with a single word (positive, neutral, or negative):\n\n\"{text}\""
     response = client.models.generate_content(
