@@ -11,6 +11,7 @@ from google.genai import types
 from transitions import Machine
 
 load_dotenv()
+
 class LLMClient:
     def __init__(self, api_key=None, model="gemini-2.0-flash"):
         self.api_key = api_key or os.getenv('GEMINI_KEY')
@@ -35,6 +36,7 @@ class LLMClient:
         )
         label = response.text.strip().lower()
         return label if label in ['positive', 'neutral', 'negative'] else 'neutral'
+
 
     def chat(self, messages, temperature=0.5, max_tokens=600):
         prompt = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
