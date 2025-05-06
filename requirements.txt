@@ -6,3 +6,6 @@ python-docx
 langchain
 tiktoken
 transitions
+psycopg2-binary
+sqlalchemy
+pgvector

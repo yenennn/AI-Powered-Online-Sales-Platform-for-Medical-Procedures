@@ -10,6 +10,66 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from google import genai
 from google.genai import types
 from transitions import Machine
+from sqlalchemy import create_engine, Column, Integer, String, Float, Text, text
+from sqlalchemy.orm import declarative_base, sessionmaker
+from pgvector.sqlalchemy import Vector
+from sentence_transformers import SentenceTransformer, util
+
+load_dotenv()
+
+# Database configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/vector_db")
+Base = declarative_base()
+
+
+# Define the embedding model
+class DocumentEmbedding(Base):
+    __tablename__ = 'document_embeddings'
+
+    id = Column(Integer, primary_key=True)
+    chunk_id = Column(Integer)
+    text = Column(Text)
+    embedding = Column(Vector(768))  # Adjust dimension based on your embedding model
+
+    def __repr__(self):
+        return f"<DocumentEmbedding(id={self.id}, chunk_id={self.chunk_id})>"
+
+
+# Create engine and session
+engine = create_engine(DATABASE_URL)
+Session = sessionmaker(bind=engine)
+
+class LLMClient:
+    def __init__(self, api_key=None, model="gemini-2.0-flash-lite"):
+        self.api_key = api_key or os.getenv('GEMINI_KEY')
+        self.client = genai.Client(api_key=self.api_key)
+        self.model = model
+
+    def analyze_sentiment(self, text):
+        prompt = (
+            "Sen özel bir hasta-duygu sınıflayıcıysan. "
+            "Mesajı oku ve yalnızca positive, neutral veya negative etiketlerinden biriyle yanıt ver. "
+            "Pozitif: hasta hevesli, heyecanlı veya hazır olduğunu ifade ediyorsa; "
+            "Nötr: sadece bilgi amaçlı sorular soruyorsa; "
+            "Negatif: Risklerden korktuğunu belli ediyorsa, tereddüt veya çekingenlik gösteriyorsa. "
+            f"Mesaj: \"{text}\""
+        )
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config=types.GenerateContentConfig(max_output_tokens=10, temperature=0.0)
+        )
+        label = response.text.strip().lower()
+        return label if label in ['positive','neutral','negative'] else 'neutral'
+
+    def chat(self, messages, temperature=0.5, max_tokens=600):
+        prompt = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config=types.GenerateContentConfig(max_output_tokens=max_tokens, temperature=temperature)
+        )
+        return response.text.strip()
 
 GREETING_PROMPT = """
 Sen Dr.{doctor_name}'in {operation_name} operasyonu için KARŞILAMA MODÜLÜSÜNSÜN.
@@ -90,41 +150,6 @@ Talimatlar:
 """
 
 
-load_dotenv()
-
-class LLMClient:
-    def __init__(self, api_key=None, model="gemini-2.0-flash-lite"):
-        self.api_key = api_key or os.getenv('GEMINI_KEY')
-        self.client = genai.Client(api_key=self.api_key)
-        self.model = model
-
-    def analyze_sentiment(self, text):
-        prompt = (
-            "Sen özel bir hasta-duygu sınıflayıcıysan. "
-            "Mesajı oku ve yalnızca positive, neutral veya negative etiketlerinden biriyle yanıt ver. "
-            "Pozitif: hasta hevesli, heyecanlı veya hazır olduğunu ifade ediyorsa; "
-            "Nötr: sadece bilgi amaçlı sorular soruyorsa; "
-            "Negatif: Risklerden korktuğunu belli ediyorsa, tereddüt veya çekingenlik gösteriyorsa. "
-            f"Mesaj: \"{text}\""
-        )
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=prompt,
-            config=types.GenerateContentConfig(max_output_tokens=10, temperature=0.0)
-        )
-        label = response.text.strip().lower()
-        return label if label in ['positive','neutral','negative'] else 'neutral'
-
-
-    def chat(self, messages, temperature=0.5, max_tokens=600):
-        prompt = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=prompt,
-            config=types.GenerateContentConfig(max_output_tokens=max_tokens, temperature=temperature)
-        )
-        return response.text.strip()
-
 class Operation:
     def __init__(self, name, base_price):
         self.name = name
@@ -138,6 +163,7 @@ class Doctor:
 
 STATES = ['greeting','info_request','negotiation','bye']
 
+
 class ChatSession:
     STATE_PROMPTS = {
         'greeting': GREETING_PROMPT,
@@ -148,6 +174,9 @@ class ChatSession:
     }
 
     def __init__(self, operation, doctor, document_path, patient_risk=False):
+        # Initialize the database if needed
+        Base.metadata.create_all(engine)
+
         self.machine = Machine(model=self, states=STATES, initial='greeting')
         for s in STATES:
             self.machine.add_transition(trigger=f'to_{s}', source='*', dest=s)
@@ -158,7 +187,7 @@ class ChatSession:
         self.patient_risk = patient_risk
         self.model_embed = "gemini-embedding-exp-03-07"
         self.client_embed = genai.Client(api_key=self.llm.api_key)
-        self.embeddings_df = self._generate_embeddings()
+        self._generate_embeddings()
         modifier = 1.5 if patient_risk else 1.0
         self.base_price = operation.base_price * modifier
         self.last_offer = None
@@ -199,26 +228,46 @@ class ChatSession:
         return response.embeddings[0].values
 
     def _generate_embeddings(self):
-        embeddings_file = "embeddings.csv"
-        if os.path.exists(embeddings_file):
-            df = pd.read_csv(embeddings_file)
-            df['Embeddings'] = df['Embeddings'].apply(lambda x: np.array(ast.literal_eval(x), dtype=np.float64))
-            return df
-        text = self._extract_text_and_tables_in_order()
-        chunks = self._split_text(text)
-        df = pd.DataFrame({"chunk_id": list(range(1, len(chunks)+1)), "text": chunks})
-        df['Embeddings'] = df['text'].apply(self._generate_embedding)
-        df.to_csv(embeddings_file, index=False, encoding='utf-8')
-        return df
+        """Check if embeddings exist in the database"""
+        db_session = Session()
+
+        # Check if we already have embeddings in the database
+        count = db_session.query(DocumentEmbedding).count()
+        if count == 0:
+            db_session.close()
+            raise Exception(
+                "No embeddings found in database. Please run db_embeddings.py first to generate embeddings."
+            )
+        else:
+            print(f"Found {count} existing embeddings in database.")
+
+        db_session.close()
 
     def find_best_passage(self, query):
+        """Find the most relevant passage using vector similarity search"""
         query_emb = self.client_embed.models.embed_content(model=self.model_embed, contents=query)
         query_vec = query_emb.embeddings[0].values
-        corpus = np.stack(self.embeddings_df['Embeddings'].values)
-        sims = corpus.dot(query_vec)
-        best_idx = int(np.argmax(sims))
-        idxs = [i for i in (best_idx-1, best_idx, best_idx+1) if 0 <= i < len(sims)]
-        return " ".join(self.embeddings_df.iloc[idxs]['text'].values)
+
+        db_session = Session()
+
+        # Format the query vector correctly for pgvector
+        # It needs to be in the format [x,y,z,...] not {x,y,z,...}
+        query_vec_str = str(query_vec).replace('{', '[').replace('}', ']')
+
+        # Use SQLAlchemy's text() function with proper parameter binding
+        sql = text("""
+            SELECT id, chunk_id, text, embedding <=> :query_vector AS distance
+            FROM document_embeddings
+            ORDER BY distance ASC
+            LIMIT 3
+        """).bindparams(query_vector=query_vec_str)
+
+        result = db_session.execute(sql).fetchall()
+        db_session.close()
+
+        # Combine the text from the top 3 results
+        passages = [row[2] for row in result]  # row[2] is the text column
+        return " ".join(passages)
 
     def _add_message(self, role, content):
         sentiment = self.llm.analyze_sentiment(content)
@@ -278,7 +327,10 @@ class ChatSession:
         self._add_message('user', user_text)
         self.visit_counts[self.state] += 1
         temp = min(0.9, self.base_temperature + 0.1 * (self.visit_counts[self.state] - 1))
-        ref = self.find_best_passage(user_text)
+        if self.state == 'info_request':
+            ref = self.find_best_passage(user_text)
+        else:
+            ref = user_text
 
         prompt, agg_sentiment = self._build_prompt(user_text)
 
@@ -298,6 +350,17 @@ class ChatSession:
         self._add_message('assistant', reply)
         return reply
 
+    def debug_embeddings(self):
+        """Debug the first embedding in the database"""
+        db_session = Session()
+        first_doc = db_session.query(DocumentEmbedding).first()
+        db_session.close()
+
+        if first_doc:
+            print(f"Embedding type: {type(first_doc.embedding)}")
+            print(f"Embedding sample: {str(first_doc.embedding)[:100]}...")
+        else:
+            print("No embeddings found in database")
 
 if __name__ == "__main__":
     load_dotenv()
