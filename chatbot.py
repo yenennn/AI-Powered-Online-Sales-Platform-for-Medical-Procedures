@@ -114,6 +114,7 @@ class LLMClient:
         label = response.text.strip().lower()
         return label if label in ['positive','neutral','negative'] else 'neutral'
 
+
     def chat(self, messages, temperature=0.5, max_tokens=600):
         prompt = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
         response = self.client.models.generate_content(
