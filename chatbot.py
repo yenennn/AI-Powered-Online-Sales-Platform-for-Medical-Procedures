@@ -37,7 +37,7 @@ Amaç: Hastanın prosedürle ilgili sorularına net, anlaşılır ve empatik bir
 Talimatlar:
 1. Kullanıcının sorusunu özetle ve en güncel tıbbi bilgiyi ver.
 2. Gerekirse RAG’den çekilen pasajlardan kısa alıntılar ekle, ama “RAG kullandım” deme.
-3. Eğer ihtiyaç duyduğunuzu düşünüyorsanız, ikna edici hikaye anlatımı kullan: Başarılı bir {operation.name} vakasının anekdotunu paylaş. Hastanın sana güvenmesini sağla."
+3. Eğer ihtiyaç duyduğunuzu düşünüyorsanız, ikna edici hikaye anlatımı kullan: Başarılı bir {operation_name} vakasının anekdotunu paylaş. Hastanın sana güvenmesini sağla."
 4. Teknik terimleri sadeleştir; hasta istemiyorsa karmaşık jargon kullanma.
 5. Her cevabının sonunda hastaya başka bir isteği olup olmadığını farklı şekillerde sor.
 6. Eğer kullanıcı fiyatla ilgili bir soru sorarsa, bu oturumun durumunu 'negotiation' olarak güncelle.
@@ -52,12 +52,13 @@ Talimatlar:
    “Dr. {doctor_name} %98 başarı oranına sahip…” gibi.
 2. Kullanıcıdan bir fiyat teklifi gelmezse bütçe aralığını sor: “Sizin için makul bir fiyat aralığı nedir? gibi bir soruyla”
 3. Gelen teklife göre fiyatı ayarla:
+   - Operasyonun baz fiyatı: {base_price}
    – Pozitif duygu → teklifi baz al + %5–10 artırım
    – Nötr duygu   → baz fiyatı koru
    – Negatif duygu→ teklifi baz al – %5–10 indirim
 4. Kullanıcının teklifi baz fiyatın %20 altındaysa:
    “Maalesef bu aralık mümkün değil, lütfen biraz yükseltin” de.
-5. Her adımda aggregate_sentiment değerini kullanarak stratejini güncelle.
+5. Her adımda {aggregate_sentiment} değerini kullanarak stratejini güncelle.
 6. Pazarlık tamamlandığında durumu 'bye' olarak güncelle.
 """
 
@@ -248,29 +249,51 @@ class ChatSession:
         if next_state != self.state:
             getattr(self, f'to_{next_state}')()
             self.state = next_state
-        prompt = self.STATE_PROMPTS[self.state].format(
-            doctor_name=self.doctor.name,
-            operation_name=self.operation.name
-        )
-        return prompt
+
+        # Calculate aggregate sentiment
+        sents = [m['sentiment'] for m in self.chat_history if m['role'] == 'user']
+        agg_sentiment = {
+            'positive': sents.count('positive'),
+            'neutral': sents.count('neutral'),
+            'negative': sents.count('negative')
+        }
+
+        # Format prompt based on state
+        if self.state == 'negotiation':
+            prompt = self.STATE_PROMPTS[self.state].format(
+                doctor_name=self.doctor.name,
+                operation_name=self.operation.name,
+                base_price=self.base_price,
+                aggregate_sentiment=f"positive={agg_sentiment['positive']}, neutral={agg_sentiment['neutral']}, negative={agg_sentiment['negative']}"
+            )
+        else:
+            prompt = self.STATE_PROMPTS[self.state].format(
+                doctor_name=self.doctor.name,
+                operation_name=self.operation.name
+            )
+
+        return prompt, agg_sentiment
 
     def process_user(self, user_text):
         self._add_message('user', user_text)
         self.visit_counts[self.state] += 1
         temp = min(0.9, self.base_temperature + 0.1 * (self.visit_counts[self.state] - 1))
         ref = self.find_best_passage(user_text)
-        prompt = self._build_prompt(user_text)
+
+        prompt, agg_sentiment = self._build_prompt(user_text)
+
         if self.state == 'negotiation':
-            sents = [m['sentiment'] for m in self.chat_history if m['role'] == 'user']
-            agg = f"aggregate_sentiment: positive={sents.count('positive')}, neutral={sents.count('neutral')}, negative={sents.count('negative')}"
+            agg = f"aggregate_sentiment: positive={agg_sentiment['positive']}, neutral={agg_sentiment['neutral']}, negative={agg_sentiment['negative']}"
             system_content = f"{prompt}\n{agg}\nREFERENCE: {ref}"
         else:
             system_content = f"{prompt}\nREFERENCE: {ref}"
+
         msgs = [{'role': 'system', 'content': system_content}]
         if self.memory_summary:
             msgs.append({'role': 'system', 'content': f"memory_summary: {self.memory_summary}"})
         for m in self.chat_history:
             msgs.append({'role': m['role'], 'content': m['content']})
+
         reply = self.llm.chat(msgs, temperature=temp)
         self._add_message('assistant', reply)
         return reply
