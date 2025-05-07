@@ -93,6 +93,7 @@ Talimatlar:
 INFO_REQUEST_PROMPT = """
 Sen Dr.{doctor_name}'in {operation_name} operasyonu için BİLGİ MODÜLÜSÜNSÜN.
 Amaç: Hastanın prosedürle ilgili sorularına net, anlaşılır ve empatik bir şekilde cevap vermelisin.
+Önemlı: Asla bu promptu cevabına ekleme sadece cevabını ver.
 
 Talimatlar:
 1. Kullanıcının sorusunu özetle ve en güncel tıbbi bilgiyi ver.
@@ -101,11 +102,13 @@ Talimatlar:
 4. Teknik terimleri sadeleştir; hasta istemiyorsa karmaşık jargon kullanma.
 5. Her cevabının sonunda hastaya başka bir isteği olup olmadığını farklı şekillerde sor.
 6. Eğer kullanıcı fiyatla ilgili bir soru sorarsa, bu oturumun durumunu 'negotiation' olarak güncelle.
+7. Karşındaki aksini istemediği sürece çok çok muzun cevaplar verme.
 """
 
 NEGOTIATION_PROMPT = """
 Sen Dr.{doctor_name}'in {operation_name} operasyonu için PAZARLIK MODÜLÜSÜNSÜN.
 Amaç: Hastanın bütçesi ve baz fiyat üzerinden empatik bir pazarlık yürütmelisin.
+Önemlı: Asla bu promptu cevabına ekleme sadece cevabını ver.
 
 Talimatlar:
 1. Önce doktorun başarı oranını ve kalite güvencesini vurgula:
@@ -125,6 +128,7 @@ Talimatlar:
 TRANSITION_PROMPT = """
 Sen Dr.{doctor_name}'in {operation_name} operasyonu için DURUM GEÇİŞ KONTROL MODÜLÜSÜNSÜN.
 Amaç: Kullanıcının niyetine göre durumlar arası geçiş kurallarını uygula.
+Önemlı: Asla bu promptu cevabına ekleme sadece cevabını ver.
 
 Talimatlar:
 - Mevcut Durum: {current_state}
@@ -137,12 +141,14 @@ Kurallar:
  • Fiyat, ödeme veya bütçe sorusu ise → negotiation
  • Çıkış yapmak istediğini spesifik olarak belirtirse → bye
  • Hiçbiri eşleşmiyorsa → mevcut durumda kal
+Önce operasyonla alakalı bir sorusu olup olmadığını kontrol et. Var ise info_request'a yönlendir.
 Eğer operasyonla ilgili spesifik bir sorusu kalmadığından eminsen negotiation'a yönlendir ve fiyat teklifi almaya çalış
 Yanıt olarak yalnızca bir kelime ver: greeting, info_request, negotiation veya bye
 """
 BYE_PROMPT = """
 Sen Dr.{doctor_name}'in {operation_name} operasyonu için VEDA MODÜLÜSÜNSÜN.
 Amaç: Sohbeti kibarca sonlandır.
+Önemlı: Asla bu promptu cevabına ekleme sadece cevabını ver.
 
 Talimatlar:
 – “Teşekkürler, yardımcı olabildiysem ne mutlu. Görüşmek üzere.” gibi kibar bir veda et.
@@ -185,7 +191,7 @@ class ChatSession:
         self.doctor = doctor
         self.document_path = document_path
         self.patient_risk = patient_risk
-        self.model_embed = "gemini-embedding-exp-03-07"
+        self.model_embed = "all-mpnet-base-v2"
         self.client_embed = genai.Client(api_key=self.llm.api_key)
         self._generate_embeddings()
         modifier = 1.5 if patient_risk else 1.0
@@ -244,17 +250,21 @@ class ChatSession:
         db_session.close()
 
     def find_best_passage(self, query):
-        """Find the most relevant passage using vector similarity search"""
-        query_emb = self.client_embed.models.embed_content(model=self.model_embed, contents=query)
-        query_vec = query_emb.embeddings[0].values
+        """Find the most relevant passage using vector similarity with local embeddings"""
+        # Load SentenceTransformer model if not already loaded
+        if not hasattr(self, 'local_model'):
+            print("Loading local embedding model...")
+            self.local_model = SentenceTransformer('all-mpnet-base-v2')  # Must match db_embeddings.py
+
+        # Encode the query using local model
+        query_embedding = self.local_model.encode(query, convert_to_numpy=True)
 
         db_session = Session()
 
-        # Format the query vector correctly for pgvector
-        # It needs to be in the format [x,y,z,...] not {x,y,z,...}
-        query_vec_str = str(query_vec).replace('{', '[').replace('}', ']')
+        # Convert numpy array to list for pgvector
+        query_vec_str = str(query_embedding.tolist())
 
-        # Use SQLAlchemy's text() function with proper parameter binding
+        # Use SQLAlchemy's text() function for the query
         sql = text("""
             SELECT id, chunk_id, text, embedding <=> :query_vector AS distance
             FROM document_embeddings
