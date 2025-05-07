@@ -1,30 +1,28 @@
 import os
-import time
 import docx
 import numpy as np
-import random
 from dotenv import load_dotenv
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from google import genai
 from sqlalchemy import create_engine, Column, Integer, String, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from pgvector.sqlalchemy import Vector
+from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
 # Database configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/vector_db")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:yenenn@localhost:5432/vector_db")
 Base = declarative_base()
 
 
-# Define the embedding model
+# Define the embedding model with 768 dimensions for standard SentenceTransformer models
 class DocumentEmbedding(Base):
     __tablename__ = 'document_embeddings'
 
     id = Column(Integer, primary_key=True)
     chunk_id = Column(Integer)
     text = Column(Text)
-    embedding = Column(Vector(3072))  # Updated to 3072 dimensions for Gemini embeddings
+    embedding = Column(Vector(768))  # Updated to 768 dimensions for SentenceTransformer models
 
     def __repr__(self):
         return f"<DocumentEmbedding(id={self.id}, chunk_id={self.chunk_id})>"
@@ -55,46 +53,16 @@ def split_text(text, chunk_size=1000, overlap=200):
     return splitter.split_text(text)
 
 
-def generate_embedding_with_retry(client, model, text, max_retries=5, base_delay=5):
-    """Generate embeddings with retry logic for rate limits"""
-    for attempt in range(max_retries):
-        try:
-            response = client.models.embed_content(model=model, contents=text)
-            return response.embeddings[0].values
-        except Exception as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                # Much more aggressive exponential backoff with jitter
-                wait_time = (base_delay * (2 ** attempt)) + (random.random() * 10)
-                print(f"Rate limited. Waiting {wait_time:.2f} seconds before retry {attempt + 1}/{max_retries}")
-                time.sleep(wait_time)
-            else:
-                print(f"Unexpected error: {e}")
-                raise  # Re-raise other exceptions
-
-    # If we get here, all retries failed
-    raise Exception(f"Failed to generate embedding after {max_retries} retries")
-
-
-def get_last_processed_chunk(session):
-    """Get the last processed chunk ID from the database"""
-    last_chunk = session.query(DocumentEmbedding).order_by(DocumentEmbedding.chunk_id.desc()).first()
-    return last_chunk.chunk_id if last_chunk else 0
-
-
-def setup_database_and_embeddings(document_path):
-    """Create tables and generate embeddings for document"""
-    # Initialize API client
-    api_key = os.getenv("GEMINI_KEY")
-    client = genai.Client(api_key=api_key)
-    model = "gemini-embedding-exp-03-07"
+def setup_database_and_embeddings(document_path, model_name='all-mpnet-base-v2'):
+    """Create tables and generate embeddings for document using SentenceTransformer"""
+    print(f"Loading SentenceTransformer model: {model_name}")
+    model = SentenceTransformer(model_name)
 
     # Create database engine
     engine = create_engine(DATABASE_URL)
 
-    # Drop the table if it exists (because we need to change the vector dimension)
+    # Drop existing tables and create new ones
     Base.metadata.drop_all(engine)
-
-    # Create tables with new schema
     Base.metadata.create_all(engine)
 
     Session = sessionmaker(bind=engine)
@@ -107,49 +75,46 @@ def setup_database_and_embeddings(document_path):
     print(f"Document split into {len(chunks)} chunks.")
 
     # Generate and store embeddings
-    print("Generating embeddings (this may take a while)...")
+    print("Generating embeddings with local model...")
 
-    # More conservative processing - start with a longer delay
-    time_between_calls = 10  # seconds between API calls
+    batch_size = 8  # Process chunks in batches for efficiency
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i:i + batch_size]
+        print(f"Processing batch {i // batch_size + 1}/{(len(chunks) + batch_size - 1) // batch_size}")
 
-    for i in range(1, len(chunks) + 1):
-        chunk = chunks[i - 1]
-        print(f"Processing chunk {i}/{len(chunks)}")
+        # Generate embeddings for the batch
+        embeddings = model.encode(batch, convert_to_numpy=True)
 
-        try:
-            embedding_vector = generate_embedding_with_retry(client, model, chunk, max_retries=5, base_delay=10)
+        # Store each embedding in the database
+        for j, embedding_vector in enumerate(embeddings):
+            chunk_index = i + j + 1
+            if chunk_index <= len(chunks):
+                # Verify the embedding dimension
+                if len(embedding_vector) != 768:
+                    print(f"Warning: Expected embedding dimension 768, got {len(embedding_vector)}")
 
-            # Check embedding dimension
-            print(f"Embedding dimension: {len(embedding_vector)}")
+                embedding = DocumentEmbedding(
+                    chunk_id=chunk_index,
+                    text=chunks[chunk_index - 1],
+                    embedding=embedding_vector
+                )
+                db_session.add(embedding)
 
-            embedding = DocumentEmbedding(
-                chunk_id=i,
-                text=chunk,
-                embedding=embedding_vector
-            )
-            db_session.add(embedding)
-
-            # Commit after each chunk
-            db_session.commit()
-            print(f"Successfully processed chunk {i}")
-
-            # Sleep between API calls to avoid rate limits
-            sleep_time = time_between_calls + (random.random() * 4)  # Add jitter
-            print(f"Waiting {sleep_time:.2f} seconds before next call")
-            time.sleep(sleep_time)
-
-        except Exception as e:
-            print(f"Error on chunk {i}: {e}")
-            # If we hit too many errors, increase delay time
-            time_between_calls += 2
-            print(f"Increased delay to {time_between_calls} seconds")
-            db_session.rollback()  # Roll back on error
-            time.sleep(15)  # Longer cooldown period
+        # Commit after each batch
+        db_session.commit()
+        print(f"Successfully processed {len(batch)} chunks (total: {min(i + batch_size, len(chunks))}/{len(chunks)})")
 
     db_session.close()
-    print(f"Finished processing embeddings.")
+    print(f"Finished processing all embeddings without any API limits!")
+
+
+
 
 
 if __name__ == "__main__":
     document_path = "Definition and Purpose of Rhinoplasty.docx"
-    setup_database_and_embeddings(document_path)
+    # You can choose from several models:
+    # - 'all-mpnet-base-v2' (768 dimensions, best quality)
+    # - 'all-MiniLM-L12-v2' (384 dimensions, good quality, faster)
+    # - 'all-MiniLM-L6-v2' (384 dimensions, faster but less accurate)
+    setup_database_and_embeddings(document_path, model_name='all-mpnet-base-v2')
